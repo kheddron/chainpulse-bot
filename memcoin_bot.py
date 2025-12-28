@@ -1,265 +1,313 @@
+# ======================================================
+# ChainPulse — Full Intelligence & Whale Bot (Solana)
+# ======================================================
+
 import os
 import time
 import sqlite3
+import threading
 import requests
 import schedule
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+)
 
-# =====================
-# ENVIRONMENT VARIABLES
-# =====================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # used only for test messages
-CMC_API_KEY = os.getenv("CMC_API_KEY")
+# ======================================================
+# ENV VARIABLES
+# ======================================================
 
-if not TELEGRAM_BOT_TOKEN or not CMC_API_KEY:
-    raise Exception("Missing environment variables")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SOLSCAN_API_KEY = os.getenv("SOLSCAN_API_KEY")  # optional
 
-# =====================
-# TELEGRAM SETUP
-# =====================
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-dp = updater.dispatcher
+DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/search?q=solana"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+SOLSCAN_WHALE_URL = "https://api.solscan.io/account/transactions"
 
-# =====================
-# DATABASE SETUP
-# =====================
+# ======================================================
+# DATABASE
+# ======================================================
+
 conn = sqlite3.connect("chainpulse.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS processed_coins (
-    coin_id INTEGER PRIMARY KEY
+CREATE TABLE IF NOT EXISTS alerted_pairs (
+    pair_address TEXT PRIMARY KEY
 )
 """)
 
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    chat_id TEXT PRIMARY KEY,
-    max_age_hours INTEGER DEFAULT 3,
-    require_telegram INTEGER DEFAULT 0,
-    require_twitter INTEGER DEFAULT 0
+CREATE TABLE IF NOT EXISTS filters (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS prices (
+    pair_address TEXT PRIMARY KEY,
+    last_price REAL
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS whale_wallets (
+    address TEXT PRIMARY KEY
 )
 """)
 
 conn.commit()
 
-# =====================
-# HELPER FUNCTIONS
-# =====================
-def ensure_user(chat_id):
+# ======================================================
+# DEFAULT FILTERS
+# ======================================================
+
+DEFAULT_FILTERS = {
+    "min_liquidity": 20000,
+    "min_volume": 50000,
+    "min_score": 55,
+    "price_change_pct": 15,
+    "auto_scan": 0,
+    "scan_interval": 10
+}
+
+for k, v in DEFAULT_FILTERS.items():
     cursor.execute(
-        "INSERT OR IGNORE INTO users (chat_id) VALUES (?)",
-        (chat_id,)
+        "INSERT OR IGNORE INTO filters VALUES (?,?)",
+        (k, str(v))
+    )
+
+conn.commit()
+
+# ======================================================
+# FILTER HELPERS
+# ======================================================
+
+def get_filter(key):
+    cursor.execute("SELECT value FROM filters WHERE key=?", (key,))
+    return cursor.fetchone()[0]
+
+def set_filter(key, value):
+    cursor.execute(
+        "UPDATE filters SET value=? WHERE key=?",
+        (str(value), key)
     )
     conn.commit()
 
-def coin_already_processed(coin_id):
-    cursor.execute(
-        "SELECT 1 FROM processed_coins WHERE coin_id = ?",
-        (coin_id,)
-    )
-    return cursor.fetchone() is not None
+# ======================================================
+# SCORING
+# ======================================================
 
-def mark_coin_processed(coin_id):
-    cursor.execute(
-        "INSERT OR IGNORE INTO processed_coins (coin_id) VALUES (?)",
-        (coin_id,)
-    )
-    conn.commit()
+def score_token(pair):
+    score = 0
+    liq = pair.get("liquidity", {}).get("usd", 0)
+    vol = pair.get("volume", {}).get("h24", 0)
 
-def get_user_filters(chat_id):
-    cursor.execute("""
-        SELECT max_age_hours, require_telegram, require_twitter
-        FROM users WHERE chat_id = ?
-    """, (chat_id,))
+    if liq >= 50000: score += 30
+    elif liq >= 20000: score += 20
+
+    if vol >= 100000: score += 30
+    elif vol >= 50000: score += 20
+
+    socials = pair.get("info", {}).get("socials", [])
+    if any(s["type"] == "telegram" for s in socials): score += 10
+    if any(s["type"] == "twitter" for s in socials): score += 10
+
+    return min(score, 100)
+
+# ======================================================
+# FILTER ENGINE
+# ======================================================
+
+def passes_filters(pair):
+    liq = pair.get("liquidity", {}).get("usd", 0)
+    vol = pair.get("volume", {}).get("h24", 0)
+    score = score_token(pair)
+
+    if liq < float(get_filter("min_liquidity")): return False
+    if vol < float(get_filter("min_volume")): return False
+    if score < float(get_filter("min_score")): return False
+
+    return True
+
+# ======================================================
+# PRICE CHANGE ALERTS
+# ======================================================
+
+def price_change_alert(pair):
+    pair_addr = pair["pairAddress"]
+    price = float(pair["priceUsd"])
+
+    cursor.execute(
+        "SELECT last_price FROM prices WHERE pair_address=?",
+        (pair_addr,)
+    )
     row = cursor.fetchone()
 
     if not row:
+        cursor.execute(
+            "INSERT INTO prices VALUES (?,?)",
+            (pair_addr, price)
+        )
+        conn.commit()
         return None
 
-    return {
-        "max_age_hours": row[0],
-        "require_telegram": row[1],
-        "require_twitter": row[2],
-    }
+    last_price = row[0]
+    pct = ((price - last_price) / last_price) * 100
 
-# =====================
-# TELEGRAM COMMANDS
-# =====================
-def start(update, context):
-    chat_id = str(update.effective_chat.id)
-    ensure_user(chat_id)
-
-    update.message.reply_text(
-        "👋 Welcome to *ChainPulse*\n\n"
-        "I monitor newly listed crypto tokens and alert you early.\n\n"
-        "Commands:\n"
-        "/filters – customize alerts\n"
-        "/status – bot status\n"
-        "/help – info",
-        parse_mode="Markdown"
-    )
-
-def help_command(update, context):
-    update.message.reply_text(
-        "ℹ️ *ChainPulse Help*\n\n"
-        "• Automatic memecoin alerts\n"
-        "• User-controlled filters\n"
-        "• 24/7 monitoring\n\n"
-        "Use /filters to customize alerts.",
-        parse_mode="Markdown"
-    )
-
-def status(update, context):
-    update.message.reply_text(
-        "✅ ChainPulse is running\n"
-        "🔍 Scanning new listings\n"
-        "☁️ Deployed 24/7"
-    )
-
-def filters(update, context):
-    chat_id = str(update.effective_chat.id)
-    ensure_user(chat_id)
-    args = context.args
-
-    if len(args) == 0:
-        update.message.reply_text(
-            "⚙️ *Filters*\n\n"
-            "/filters age <hours>\n"
-            "/filters telegram on|off\n"
-            "/filters twitter on|off\n\n"
-            "Example:\n"
-            "/filters age 1",
-            parse_mode="Markdown"
+    if abs(pct) >= float(get_filter("price_change_pct")):
+        cursor.execute(
+            "UPDATE prices SET last_price=? WHERE pair_address=?",
+            (price, pair_addr)
         )
-        return
-
-    option = args[0]
-
-    try:
-        if option == "age" and len(args) == 2:
-            hours = int(args[1])
-            cursor.execute(
-                "UPDATE users SET max_age_hours = ? WHERE chat_id = ?",
-                (hours, chat_id)
-            )
-
-        elif option == "telegram" and len(args) == 2:
-            value = 1 if args[1] == "on" else 0
-            cursor.execute(
-                "UPDATE users SET require_telegram = ? WHERE chat_id = ?",
-                (value, chat_id)
-            )
-
-        elif option == "twitter" and len(args) == 2:
-            value = 1 if args[1] == "on" else 0
-            cursor.execute(
-                "UPDATE users SET require_twitter = ? WHERE chat_id = ?",
-                (value, chat_id)
-            )
-
-        else:
-            update.message.reply_text("❌ Invalid filter command")
-            return
-
         conn.commit()
-        update.message.reply_text("✅ Filter updated")
+        return pct
 
-    except Exception as e:
-        update.message.reply_text("❌ Error updating filter")
+    return None
 
-# =====================
-# REGISTER COMMANDS
-# =====================
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(CommandHandler("help", help_command))
-dp.add_handler(CommandHandler("filters", filters))
-dp.add_handler(CommandHandler("status", status))
+# ======================================================
+# SCANNER
+# ======================================================
 
-# =====================
-# COIN SCANNER
-# =====================
-def get_new_coins():
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
-    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-    params = {"limit": 200, "sort": "date_added", "sort_dir": "desc"}
+def scan(update: Update, context: CallbackContext):
+    r = requests.get(DEXSCREENER_URL, timeout=15)
+    pairs = r.json().get("pairs", [])
+    sent = 0
 
-    try:
-        data = requests.get(url, headers=headers, params=params).json()
-        return data.get("data", [])
-    except:
-        return []
-
-def extract_socials(coin):
-    urls = coin.get("urls", {})
-    return {
-        "telegram": urls.get("telegram", [None])[0] if urls.get("telegram") else None,
-        "twitter": urls.get("twitter", [None])[0] if urls.get("twitter") else None
-    }
-
-def send_alert(chat_id, coin, socials):
-    buttons = []
-    if socials["telegram"]:
-        buttons.append([InlineKeyboardButton("Telegram", url=socials["telegram"])])
-    if socials["twitter"]:
-        buttons.append([InlineKeyboardButton("X", url=socials["twitter"])])
-
-    markup = InlineKeyboardMarkup(buttons) if buttons else None
-
-    text = (
-        f"🚀 *New Token Detected*\n\n"
-        f"Name: {coin['name']}\n"
-        f"Symbol: {coin['symbol']}"
-    )
-
-    bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
-
-def process_new_coins():
-    coins = get_new_coins()
-    now = datetime.utcnow()
-
-    cursor.execute("SELECT chat_id FROM users")
-    users = cursor.fetchall()
-
-    for coin in coins:
-        if coin_already_processed(coin["id"]):
+    for pair in pairs:
+        addr = pair.get("pairAddress")
+        if not addr:
             continue
 
-        added = datetime.fromisoformat(coin["date_added"].replace("Z", ""))
-        socials = extract_socials(coin)
+        cursor.execute(
+            "SELECT 1 FROM alerted_pairs WHERE pair_address=?",
+            (addr,)
+        )
+        if cursor.fetchone():
+            continue
 
-        for (chat_id,) in users:
-            filters = get_user_filters(chat_id)
+        if not passes_filters(pair):
+            continue
 
-            if now - added > timedelta(hours=filters["max_age_hours"]):
-                continue
-            if filters["require_telegram"] and not socials["telegram"]:
-                continue
-            if filters["require_twitter"] and not socials["twitter"]:
-                continue
+        pct = price_change_alert(pair)
+        score = score_token(pair)
 
-            send_alert(chat_id, coin, socials)
+        base = pair["baseToken"]
+        msg = f"""
+🚀 *New Solana Token*
 
-        mark_coin_processed(coin["id"])
+🪙 {base['name']} ({base['symbol']})
+💧 Liquidity: ${pair['liquidity']['usd']:,.0f}
+📊 Volume 24h: ${pair['volume']['h24']:,.0f}
+🧠 Score: {score}/100
+"""
 
-# =====================
-# START EVERYTHING
-# =====================
-schedule.every(10).minutes.do(process_new_coins)
+        if pct:
+            msg += f"\n📈 *Price Change:* {pct:.2f}%"
 
+        update.message.reply_text(msg, parse_mode="Markdown")
+
+        cursor.execute(
+            "INSERT INTO alerted_pairs VALUES (?)",
+            (addr,)
+        )
+        conn.commit()
+        sent += 1
+
+    update.message.reply_text(f"✅ Scan complete — {sent} alerts.")
+
+# ======================================================
+# SOL PRICE
+# ======================================================
+
+def sol_price(update, context):
+    r = requests.get(
+        COINGECKO_URL,
+        params={"ids": "solana", "vs_currencies": "usd"}
+    )
+    price = r.json()["solana"]["usd"]
+    update.message.reply_text(f"💰 SOL Price: ${price:,.2f}")
+
+# ======================================================
+# WHALE TRACKING
+# ======================================================
+
+def add_whale(update, context):
+    if not context.args:
+        update.message.reply_text("Usage: /add_whale WALLET_ADDRESS")
+        return
+
+    addr = context.args[0]
+    cursor.execute(
+        "INSERT OR IGNORE INTO whale_wallets VALUES (?)",
+        (addr,)
+    )
+    conn.commit()
+    update.message.reply_text("🐋 Whale wallet added.")
+
+def check_whales():
+    if not SOLSCAN_API_KEY:
+        return
+
+    cursor.execute("SELECT address FROM whale_wallets")
+    wallets = cursor.fetchall()
+
+    headers = {"token": SOLSCAN_API_KEY}
+
+    for (addr,) in wallets:
+        r = requests.get(
+            SOLSCAN_WHALE_URL,
+            params={"account": addr, "limit": 1},
+            headers=headers
+        )
+        if r.status_code == 200:
+            tx = r.json()["data"][0]
+            print("🐋 Whale activity:", addr, tx["txHash"])
+
+# ======================================================
+# AUTO ALERTS
+# ======================================================
+
+def auto_on(update, context):
+    set_filter("auto_scan", 1)
+    update.message.reply_text("✅ Auto alerts enabled")
+
+def auto_off(update, context):
+    set_filter("auto_scan", 0)
+    update.message.reply_text("⛔ Auto alerts disabled")
+
+def auto_loop():
+    if int(get_filter("auto_scan")):
+        dummy = type("obj", (), {})()
+        dummy.message = type("obj", (), {"reply_text": print})
+        scan(dummy, None)
+        check_whales()
+
+schedule.every(10).minutes.do(auto_loop)
+threading.Thread(
+    target=lambda: [schedule.run_pending() or time.sleep(1)],
+    daemon=True
+).start()
+
+# ======================================================
+# BOT SETUP
+# ======================================================
+
+updater = Updater(BOT_TOKEN, use_context=True)
+dp = updater.dispatcher
+
+dp.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("🤖 ChainPulse online")))
+dp.add_handler(CommandHandler("scan", scan))
+dp.add_handler(CommandHandler("sol", sol_price))
+dp.add_handler(CommandHandler("auto_on", auto_on))
+dp.add_handler(CommandHandler("auto_off", auto_off))
+dp.add_handler(CommandHandler("add_whale", add_whale))
+
+print("🚀 ChainPulse running")
 updater.start_polling()
-print("🤖 ChainPulse running 24/7")
-
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+updater.idle()
